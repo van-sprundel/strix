@@ -271,7 +271,7 @@ class LLM:
                 "instructions require prose; use the appropriate Strix finish tool "
                 "when the assessment is complete.\n\n"
                 "<strix_system_prompt>\n"
-                f"{self.system_prompt}\n"
+                f"{self._acp_strix_system_prompt()}\n"
                 "</strix_system_prompt>\n\n"
                 "<conversation>\n"
                 f"{self._format_acp_messages(messages)}\n"
@@ -290,6 +290,30 @@ class LLM:
             "<conversation_updates>\n"
             f"{self._format_acp_messages(messages)}\n"
             "</conversation_updates>"
+        )
+
+    def _acp_strix_system_prompt(self) -> str:
+        return (
+            "You are operating inside Strix as the language model for an authorized "
+            "defensive repository review of local code. Strix, not Codex, executes "
+            "all tools. Your job is to choose the next Strix XML tool call, read "
+            "tool results, coordinate focused child agents when useful, and finish "
+            "only after the review has enough evidence.\n\n"
+            "Rules:\n"
+            "- Output at most one XML tool call per assistant message.\n"
+            "- Do not call Codex native shell, search, file-read, or MCP tools.\n"
+            "- Use terminal_execute, list_files, search_files, and str_replace_editor "
+            "through Strix XML when repository inspection is needed.\n"
+            "- Use create_agent for focused parallel code-review subtasks when the "
+            "root task benefits from separate component reviews.\n"
+            "- Keep a shared wiki note for source maps and follow-up context.\n"
+            "- Use create_vulnerability_report only for confirmed defensive findings "
+            "with concrete code evidence and remediation.\n"
+            "- Use finish_scan when the root review is complete; subagents use "
+            "agent_finish.\n\n"
+            "<available_strix_xml_tools>\n"
+            f"{get_tools_prompt()}\n"
+            "</available_strix_xml_tools>"
         )
 
     def _build_acp_agent_prompt(self, conversation_history: list[dict[str, Any]]) -> str:

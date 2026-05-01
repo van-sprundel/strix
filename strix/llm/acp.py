@@ -219,6 +219,9 @@ class ACPClient:
         enabled = (Config.get("strix_acp_enable_mcp") or "true").lower()
         if enabled in {"0", "false", "no", "off"}:
             return []
+        acp_mode = (Config.get("strix_acp_mode") or "strix").lower()
+        if acp_mode not in {"agent", "external"}:
+            return []
 
         if self._mcp_transport() == "http":
             port = await self._start_http_mcp_server()

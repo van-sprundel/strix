@@ -40,12 +40,7 @@ for line in sys.stdin:
     elif method == "authenticate":
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/new":
-        assert request["params"]["mcpServers"]
-        assert request["params"]["mcpServers"][0]["name"] == "strix"
-        assert request["params"]["mcpServers"][0]["args"][0].endswith("mcp_server.py")
-        assert {
-            item["name"]: item["value"] for item in request["params"]["mcpServers"][0]["env"]
-        }["STRIX_MCP_DEBUG_LOG"].endswith("acp-debug.mcp.jsonl")
+        assert request["params"]["mcpServers"] == []
         send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -94,6 +89,8 @@ for line in sys.stdin:
         prompt = request["params"]["prompt"][0]["text"]
         assert "Strix XML tool calls" in prompt
         assert "Do not use native Codex" in prompt
+        assert "Deep Testing Mode" not in prompt
+        assert "relentless" not in prompt.lower()
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -432,6 +429,7 @@ async def test_acp_prefers_http_mcp_when_agent_supports_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("STRIX_ACP_DEBUG_LOG", str(tmp_path / "acp-debug.jsonl"))
+    monkeypatch.setenv("STRIX_ACP_MODE", "agent")
     client = ACPClient("codex", timeout=1, cwd=str(tmp_path), command="codex-acp")
     client._mcp_capabilities = {"http": True}
     try:
