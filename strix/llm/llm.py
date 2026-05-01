@@ -227,7 +227,10 @@ class LLM:
         guidance = (
             "You are running as the ACP-backed Codex agent for Strix. "
             "Perform the requested authorized security assessment using your available "
-            "tools. Do not try to call Strix XML tools. Keep shell output bounded: add "
+            "tools. Use the Strix MCP tool `terminal_execute` for shell commands, file "
+            "reads, and repository searches. Do not use native Codex shell, search, or "
+            "read tools, because Strix cannot reliably observe their lifecycle through "
+            "ACP. Do not try to call Strix XML tools. Keep shell output bounded: add "
             "limits such as `| head -200`, `--max-count`, narrower globs, or targeted "
             "paths for broad searches, avoid shell pipelines when a direct command can "
             "produce a bounded result, and avoid commands that emit thousands of lines. "

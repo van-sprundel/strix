@@ -1,19 +1,43 @@
 import asyncio
 import contextlib
 import json
+import os
 import shlex
+import signal
 import sys
 import time
 from asyncio.subprocess import PIPE, Process
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from strix.config import Config
 
 
 class ACPError(Exception):
     pass
+
+
+class ACPTerminal:
+    def __init__(self, process: Process, output_byte_limit: int):
+        self.process = process
+        self.output_byte_limit = output_byte_limit
+        self.output = bytearray()
+        self.truncated = False
+        self.reader_task: asyncio.Task[None] | None = None
+
+    def append(self, chunk: bytes) -> None:
+        self.output.extend(chunk)
+        if len(self.output) > self.output_byte_limit:
+            self.truncated = True
+            self.output = self.output[-self.output_byte_limit :]
+
+    def text(self) -> str:
+        text = self.output.decode("utf-8", "replace")
+        if self.truncated:
+            return f"[output truncated to last {self.output_byte_limit} bytes]\n{text}"
+        return text
 
 
 class ACPClient:
@@ -42,6 +66,7 @@ class ACPClient:
         self._config_options: list[dict[str, Any]] = []
         self._debug_log_path = Config.get("strix_acp_debug_log")
         self._idle_timeout = self._float_config("strix_acp_idle_timeout", 60.0)
+        self._terminals: dict[str, ACPTerminal] = {}
         self._closed = False
 
     def _default_command(self, agent: str) -> str:
@@ -91,6 +116,10 @@ class ACPClient:
             with contextlib.suppress(Exception):
                 await self.request("session/close", {"sessionId": self._session_id})
 
+        for terminal_id in list(self._terminals):
+            with contextlib.suppress(Exception):
+                await self._release_terminal(terminal_id)
+
         for task in (self._reader_task, self._stderr_task):
             if task and not task.done():
                 task.cancel()
@@ -109,8 +138,8 @@ class ACPClient:
             {
                 "protocolVersion": 1,
                 "clientCapabilities": {
-                    "fs": {"readTextFile": False, "writeTextFile": False},
-                    "terminal": False,
+                    "fs": {"readTextFile": True, "writeTextFile": False},
+                    "terminal": True,
                 },
                 "clientInfo": {
                     "name": "strix",
@@ -179,6 +208,7 @@ class ACPClient:
                 "command": sys.executable,
                 "args": ["-m", "strix.llm.mcp_server"],
                 "env": [
+                    {"name": "STRIX_MCP_CWD", "value": str(Path(self.cwd).resolve())},
                     {"name": "STRIX_SANDBOX_MODE", "value": "false"},
                     {"name": "STRIX_DISABLE_BROWSER", "value": "true"},
                 ],
@@ -401,30 +431,198 @@ class ACPClient:
         method = message.get("method")
         request_id = message.get("id")
         if method == "session/request_permission":
-            await self._send(
+            await self._reply_result(
+                request_id,
                 {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "outcome": {
-                            "outcome": "selected",
-                            "optionId": self._select_permission_option(message),
-                        }
-                    },
-                }
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": self._select_permission_option(message),
+                    }
+                },
             )
             return
 
+        try:
+            if method == "terminal/create":
+                result = await self._terminal_create(message)
+            elif method == "terminal/output":
+                result = self._terminal_output(message)
+            elif method == "terminal/wait_for_exit":
+                result = await self._terminal_wait_for_exit(message)
+            elif method == "terminal/kill":
+                result = await self._terminal_kill(message)
+            elif method == "terminal/release":
+                result = await self._terminal_release(message)
+            elif method == "fs/read_text_file":
+                result = self._fs_read_text_file(message)
+            elif method == "fs/write_text_file":
+                await self._reply_error(
+                    request_id, -32601, "ACP fs/write_text_file is not supported by Strix"
+                )
+                return
+            else:
+                await self._reply_error(
+                    request_id, -32601, f"Unsupported ACP client method: {method}"
+                )
+                return
+        except (ACPError, OSError, TypeError, ValueError) as e:
+            await self._reply_error(request_id, -32000, str(e))
+            return
+
+        await self._reply_result(request_id, result)
+
+    async def _reply_result(self, request_id: Any, result: dict[str, Any]) -> None:
+        await self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    async def _reply_error(self, request_id: Any, code: int, message: str) -> None:
         await self._send(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Unsupported ACP client method: {method}",
-                },
+                "error": {"code": code, "message": message},
             }
         )
+
+    async def _terminal_create(self, message: dict[str, Any]) -> dict[str, Any]:
+        params = message.get("params") or {}
+        command = params.get("command")
+        if not command:
+            raise ACPError("terminal/create missing command")
+
+        args = params.get("args") or []
+        if not isinstance(args, list):
+            raise ACPError("terminal/create args must be a list")
+        argv = [str(command), *[str(arg) for arg in args]]
+
+        cwd = params.get("cwd")
+        if cwd is not None:
+            cwd = str(cwd)
+
+        env = os.environ.copy()
+        for entry in params.get("env") or []:
+            if not isinstance(entry, dict) or "name" not in entry:
+                continue
+            env[str(entry["name"])] = str(entry.get("value") or "")
+
+        output_byte_limit = params.get("outputByteLimit") or 1_048_576
+        with contextlib.suppress(TypeError, ValueError):
+            output_byte_limit = int(output_byte_limit)
+        output_byte_limit = max(1024, int(output_byte_limit))
+
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=cwd,
+            env=env,
+        )
+        if process.stdin:
+            process.stdin.close()
+        terminal = ACPTerminal(process, output_byte_limit)
+        terminal_id = f"strix-{uuid4().hex}"
+        terminal.reader_task = asyncio.create_task(self._read_terminal_output(terminal))
+        self._terminals[terminal_id] = terminal
+        return {"terminalId": terminal_id}
+
+    async def _read_terminal_output(self, terminal: ACPTerminal) -> None:
+        stdout = terminal.process.stdout
+        if stdout is None:
+            return
+        while True:
+            chunk = await stdout.read(8192)
+            if not chunk:
+                break
+            terminal.append(chunk)
+
+    def _terminal_output(self, message: dict[str, Any]) -> dict[str, Any]:
+        terminal = self._get_terminal(message)
+        result: dict[str, Any] = {
+            "output": terminal.text(),
+            "truncated": terminal.truncated,
+        }
+        if terminal.process.returncode is not None:
+            result["exitStatus"] = self._exit_status(terminal.process.returncode)
+        return result
+
+    async def _terminal_wait_for_exit(self, message: dict[str, Any]) -> dict[str, Any]:
+        terminal = self._get_terminal(message)
+        returncode = await terminal.process.wait()
+        if terminal.reader_task:
+            await terminal.reader_task
+        return self._exit_status(returncode)
+
+    async def _terminal_kill(self, message: dict[str, Any]) -> dict[str, Any]:
+        terminal = self._get_terminal(message)
+        if terminal.process.returncode is None:
+            terminal.process.terminate()
+            try:
+                await asyncio.wait_for(terminal.process.wait(), timeout=2)
+            except TimeoutError:
+                terminal.process.kill()
+                await terminal.process.wait()
+        if terminal.reader_task:
+            with contextlib.suppress(asyncio.CancelledError):
+                await terminal.reader_task
+        return {}
+
+    async def _terminal_release(self, message: dict[str, Any]) -> dict[str, Any]:
+        params = message.get("params") or {}
+        await self._release_terminal(str(params.get("terminalId") or ""))
+        return {}
+
+    async def _release_terminal(self, terminal_id: str) -> None:
+        terminal = self._terminals.pop(terminal_id, None)
+        if not terminal:
+            return
+        if terminal.process.returncode is None:
+            terminal.process.terminate()
+            try:
+                await asyncio.wait_for(terminal.process.wait(), timeout=2)
+            except TimeoutError:
+                terminal.process.kill()
+                await terminal.process.wait()
+        if terminal.reader_task and not terminal.reader_task.done():
+            terminal.reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await terminal.reader_task
+
+    def _get_terminal(self, message: dict[str, Any]) -> ACPTerminal:
+        params = message.get("params") or {}
+        terminal_id = str(params.get("terminalId") or "")
+        terminal = self._terminals.get(terminal_id)
+        if terminal is None:
+            raise ACPError(f"Unknown ACP terminal: {terminal_id}")
+        return terminal
+
+    def _exit_status(self, returncode: int) -> dict[str, Any]:
+        if returncode < 0:
+            try:
+                signal_name = signal.Signals(-returncode).name
+            except ValueError:
+                signal_name = str(-returncode)
+            return {"exitCode": None, "signal": signal_name}
+        return {"exitCode": returncode, "signal": None}
+
+    def _fs_read_text_file(self, message: dict[str, Any]) -> dict[str, Any]:
+        params = message.get("params") or {}
+        raw_path = params.get("path")
+        if not raw_path:
+            raise ACPError("fs/read_text_file missing path")
+
+        path = Path(str(raw_path)).expanduser()
+        if not path.is_absolute():
+            path = Path(self.cwd) / path
+
+        content = path.read_text(encoding="utf-8", errors="replace")
+        line = int(params.get("line") or 1)
+        limit = params.get("limit")
+        if line > 1 or limit is not None:
+            lines = content.splitlines(keepends=True)
+            start = max(0, line - 1)
+            end = None if limit is None else start + max(0, int(limit))
+            content = "".join(lines[start:end])
+        return {"content": content}
 
     def _select_permission_option(self, message: dict[str, Any]) -> str:
         params = message.get("params") or {}

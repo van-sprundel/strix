@@ -1,7 +1,9 @@
 import asyncio
 import inspect
 import json
+import os
 import sys
+from pathlib import Path
 from typing import Any, get_args, get_origin
 
 import defusedxml.ElementTree as DefusedET
@@ -21,6 +23,8 @@ EXCLUDED_TOOLS = {
     "stop_agent",
     "send_user_message_to_agent",
 }
+TERMINAL_OUTPUT_LIMIT = 64_000
+TERMINAL_TIMEOUT = 60.0
 
 
 def _read_message() -> dict[str, Any] | None:
@@ -136,7 +140,43 @@ def _input_schema(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _list_tools() -> list[dict[str, Any]]:
-    return [
+    listed = [
+        {
+            "name": "terminal_execute",
+            "description": (
+                "Execute a bounded shell command in the target repository. Use this for "
+                "all repository searches, file reads, and CLI commands when Strix runs "
+                "through ACP. Output is capped and long-running commands time out."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run with bash -lc.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": (
+                            "Optional working directory. Defaults to STRIX_MCP_CWD or "
+                            "the MCP server current directory."
+                        ),
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Optional timeout in seconds, capped at 60.",
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "description": "Optional output cap, capped at 64000 characters.",
+                    },
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+    listed.extend(
         {
             "name": str(tool["name"]),
             "description": _tool_description(tool),
@@ -144,10 +184,73 @@ def _list_tools() -> list[dict[str, Any]]:
         }
         for tool in tools
         if _is_exposed_tool(tool)
-    ]
+    )
+    return listed
+
+
+async def _execute_terminal(arguments: dict[str, Any]) -> dict[str, Any]:
+    command = str(arguments.get("command") or "")
+    if not command.strip():
+        return {
+            "content": [{"type": "text", "text": "Command must not be empty"}],
+            "isError": True,
+        }
+
+    cwd = str(arguments.get("cwd") or os.getenv("STRIX_MCP_CWD") or Path.cwd())
+    timeout = min(float(arguments.get("timeout") or TERMINAL_TIMEOUT), TERMINAL_TIMEOUT)
+    output_limit = min(
+        int(arguments.get("max_output_chars") or TERMINAL_OUTPUT_LIMIT),
+        TERMINAL_OUTPUT_LIMIT,
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        "/usr/bin/bash",
+        "-lc",
+        command,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        timed_out = False
+    except TimeoutError:
+        process.kill()
+        stdout, stderr = await process.communicate()
+        timed_out = True
+
+    stdout_text = stdout.decode("utf-8", "replace")
+    stderr_text = stderr.decode("utf-8", "replace")
+    combined = stdout_text
+    if stderr_text:
+        combined = (
+            f"{combined}\n[stderr]\n{stderr_text}" if combined else f"[stderr]\n{stderr_text}"
+        )
+
+    truncated = len(combined) > output_limit
+    if truncated:
+        combined = combined[-output_limit:]
+        combined = f"[output truncated to last {output_limit} chars]\n{combined}"
+
+    result = {
+        "command": command,
+        "argv": ["/usr/bin/bash", "-lc", command],
+        "cwd": cwd,
+        "exit_code": process.returncode,
+        "timed_out": timed_out,
+        "truncated": truncated,
+        "output": combined,
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}],
+        "isError": timed_out or process.returncode not in {0, None},
+    }
 
 
 async def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if name == "terminal_execute":
+        return await _execute_terminal(arguments)
+
     if name not in {tool["name"] for tool in tools if _is_exposed_tool(tool)}:
         return {
             "content": [{"type": "text", "text": f"Tool '{name}' is not available"}],
@@ -201,18 +304,18 @@ async def _handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
     return _error(request_id, -32601, f"Unsupported MCP method: {method}")
 
 
-async def _run() -> None:
+def _run() -> None:
     while True:
-        message = await asyncio.to_thread(_read_message)
+        message = _read_message()
         if message is None:
             return
-        response = await _handle_request(message)
+        response = asyncio.run(_handle_request(message))
         if response is not None:
             _write_message(response)
 
 
 def main() -> None:
-    asyncio.run(_run())
+    _run()
 
 
 if __name__ == "__main__":
