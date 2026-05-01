@@ -7,6 +7,7 @@ import pytest
 from strix.interface.utils import configure_acp_cwd
 from strix.llm.config import LLMConfig
 from strix.llm.llm import LLM
+from strix.llm.mcp_server import _call_tool, _list_tools
 
 
 FAKE_ACP = r"""
@@ -33,6 +34,8 @@ for line in sys.stdin:
     elif method == "authenticate":
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/new":
+        assert request["params"]["mcpServers"]
+        assert request["params"]["mcpServers"][0]["name"] == "strix"
         send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "session-1"}})
     elif method == "session/prompt":
         send({
@@ -137,3 +140,17 @@ def test_configure_acp_cwd_uses_first_local_source(
     configure_acp_cwd([{"source_path": str(target), "workspace_subdir": "repo"}])
 
     assert Path(str(os.getenv("STRIX_ACP_CWD"))).resolve() == target.resolve()
+
+
+@pytest.mark.asyncio
+async def test_strix_mcp_server_exposes_local_tools() -> None:
+    listed = _list_tools()
+    names = {tool["name"] for tool in listed}
+
+    assert "think" in names
+    assert "terminal_execute" not in names
+
+    result = await _call_tool("think", {"thought": "exercise the MCP bridge"})
+
+    assert result["isError"] is False
+    assert "Thought recorded" in result["content"][0]["text"]

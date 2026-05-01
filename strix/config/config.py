@@ -26,6 +26,7 @@ class Config:
     strix_acp_permission = "allow_once"
     strix_acp_cwd = None
     strix_acp_auth_method = None
+    strix_acp_enable_mcp = "true"
     _LLM_CANONICAL_NAMES = (
         "strix_llm",
         "llm_api_key",
@@ -41,6 +42,7 @@ class Config:
         "strix_acp_permission",
         "strix_acp_cwd",
         "strix_acp_auth_method",
+        "strix_acp_enable_mcp",
     )
 
     # Tool & Feature Configuration

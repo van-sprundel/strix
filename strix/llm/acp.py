@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import shlex
+import sys
 from asyncio.subprocess import PIPE, Process
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -142,12 +143,29 @@ class ACPClient:
             "session/new",
             {
                 "cwd": str(Path(self.cwd).resolve()),
-                "mcpServers": [],
+                "mcpServers": self._mcp_servers(),
             },
         )
         if not isinstance(result, dict) or not result.get("sessionId"):
             raise ACPError(f"ACP session/new returned an invalid response: {result!r}")
         self._session_id = str(result["sessionId"])
+
+    def _mcp_servers(self) -> list[dict[str, Any]]:
+        enabled = (Config.get("strix_acp_enable_mcp") or "true").lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return []
+
+        return [
+            {
+                "name": "strix",
+                "command": sys.executable,
+                "args": ["-m", "strix.llm.mcp_server"],
+                "env": [
+                    {"name": "STRIX_SANDBOX_MODE", "value": "false"},
+                    {"name": "STRIX_DISABLE_BROWSER", "value": "true"},
+                ],
+            }
+        ]
 
     async def prompt(self, text: str) -> AsyncIterator[dict[str, Any]]:
         await self.start()
