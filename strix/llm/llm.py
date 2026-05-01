@@ -79,6 +79,7 @@ class LLM:
         )
         self._acp_client: ACPClient | None = None
         self._acp_tool_executions: dict[str, Any] = {}
+        self._acp_sent_message_count = 0
         self.system_prompt = self._load_system_prompt(agent_name)
 
         reasoning = Config.get("strix_reasoning_effort")
@@ -188,7 +189,47 @@ class LLM:
     async def _generate_acp(
         self, conversation_history: list[dict[str, Any]]
     ) -> AsyncIterator[LLMResponse]:
-        prompt = self._build_acp_prompt(conversation_history)
+        mode = (Config.get("strix_acp_mode") or "strix").lower()
+        if mode in {"agent", "external"}:
+            async for response in self._generate_acp_agent(conversation_history):
+                yield response
+            return
+
+        async for response in self._generate_acp_strix(conversation_history):
+            yield response
+
+    async def _generate_acp_strix(
+        self, conversation_history: list[dict[str, Any]]
+    ) -> AsyncIterator[LLMResponse]:
+        prompt = self._build_acp_strix_prompt(conversation_history)
+        accumulated = ""
+
+        async for response in self._prompt_acp(prompt):
+            accumulated = response.content
+            if response.stop_requested:
+                final_content = normalize_tool_format(accumulated)
+                final_content = fix_incomplete_tool_call(
+                    _truncate_to_first_function(final_content)
+                )
+                yield LLMResponse(
+                    content=final_content,
+                    tool_invocations=parse_tool_invocations(final_content),
+                )
+                return
+            yield response
+
+    async def _generate_acp_agent(
+        self, conversation_history: list[dict[str, Any]]
+    ) -> AsyncIterator[LLMResponse]:
+        prompt = self._build_acp_agent_prompt(conversation_history)
+
+        async for response in self._prompt_acp(prompt):
+            if response.stop_requested:
+                yield LLMResponse(content=response.content, stop_requested=True)
+                return
+            yield response
+
+    async def _prompt_acp(self, prompt: str) -> AsyncIterator[LLMResponse]:
         accumulated = ""
 
         if self._acp_client is None:
@@ -217,7 +258,41 @@ class LLM:
         except Exception as e:  # noqa: BLE001
             self._raise_error(e)
 
-    def _build_acp_prompt(self, conversation_history: list[dict[str, Any]]) -> str:
+    def _build_acp_strix_prompt(self, conversation_history: list[dict[str, Any]]) -> str:
+        if self._acp_sent_message_count <= 0:
+            messages = conversation_history
+            self._acp_sent_message_count = len(conversation_history)
+            return (
+                "You are the model inside Strix, not a standalone coding agent. "
+                "Follow the Strix system prompt below and respond with Strix XML tool "
+                "calls exactly as specified there. Do not use native Codex shell, "
+                "search, file-read, or MCP tools; Strix will execute XML tools and "
+                "feed results back to you. Do not finish with prose unless the Strix "
+                "instructions require prose; use the appropriate Strix finish tool "
+                "when the assessment is complete.\n\n"
+                "<strix_system_prompt>\n"
+                f"{self.system_prompt}\n"
+                "</strix_system_prompt>\n\n"
+                "<conversation>\n"
+                f"{self._format_acp_messages(messages)}\n"
+                "</conversation>"
+            )
+
+        messages = conversation_history[self._acp_sent_message_count :]
+        self._acp_sent_message_count = len(conversation_history)
+        if not messages:
+            return "<meta>Continue the Strix task. Use the next appropriate XML tool call.</meta>"
+
+        return (
+            "Continue the Strix task using only Strix XML tool calls. The following "
+            "are new Strix conversation updates since your last response; assistant "
+            "entries are your prior XML responses included only for synchronization.\n\n"
+            "<conversation_updates>\n"
+            f"{self._format_acp_messages(messages)}\n"
+            "</conversation_updates>"
+        )
+
+    def _build_acp_agent_prompt(self, conversation_history: list[dict[str, Any]]) -> str:
         last_user = ""
         for message in reversed(conversation_history):
             if message.get("role") == "user":
@@ -239,6 +314,14 @@ class LLM:
             "Executive Summary, Methodology, Technical Analysis, Recommendations."
         )
         return f"{guidance}\n\nTask:\n{last_user}"
+
+    def _format_acp_messages(self, messages: list[dict[str, Any]]) -> str:
+        parts = []
+        for message in messages:
+            role = str(message.get("role") or "user")
+            content = self._message_to_text(message)
+            parts.append(f"<message role={json.dumps(role)}>\n{content}\n</message>")
+        return "\n\n".join(parts)
 
     def _message_to_text(self, message: dict[str, Any]) -> str:
         content = message.get("content", "")

@@ -26,6 +26,7 @@ class Config:
     strix_acp_permission = "allow_once"
     strix_acp_cwd = None
     strix_acp_auth_method = None
+    strix_acp_mode = "strix"
     strix_acp_enable_mcp = "true"
     strix_acp_mcp_transport = "auto"
     strix_acp_model = None
@@ -47,6 +48,7 @@ class Config:
         "strix_acp_permission",
         "strix_acp_cwd",
         "strix_acp_auth_method",
+        "strix_acp_mode",
         "strix_acp_enable_mcp",
         "strix_acp_mcp_transport",
         "strix_acp_model",

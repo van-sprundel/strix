@@ -92,8 +92,8 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": []}})
     elif method == "session/prompt":
         prompt = request["params"]["prompt"][0]["text"]
-        assert "Keep shell output bounded" in prompt
-        assert "mcp__strix__terminal_execute" in prompt
+        assert "Strix XML tool calls" in prompt
+        assert "Do not use native Codex" in prompt
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -101,40 +101,7 @@ for line in sys.stdin:
                 "sessionId": "session-1",
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "# Executive Summary\nOK\n"},
-                },
-            },
-        })
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "session-1",
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "tool-1",
-                    "title": "git status --short",
-                    "kind": "terminal",
-                    "rawInput": {"command": "git status --short", "cwd": "/tmp/project"},
-                },
-            },
-        })
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "session-1",
-                "update": {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": "tool-1",
-                    "status": "completed",
-                    "rawOutput": json.dumps({
-                        "command": ["git", "status", "--short"],
-                        "cwd": "/tmp/project",
-                        "stdout": "",
-                        "stderr": "",
-                        "exit_code": 0,
-                    }),
+                    "content": {"type": "text", "text": "<function=think>\n"},
                 },
             },
         })
@@ -147,9 +114,7 @@ for line in sys.stdin:
                     "sessionUpdate": "agent_message_chunk",
                     "content": {
                         "type": "text",
-                        "text": "\n# Methodology\nChecked status.\n"
-                                "# Technical Analysis\nNo issues.\n"
-                                "# Recommendations\nNone.\n",
+                        "text": "<parameter=thought>Assess repo</parameter>\n</function>",
                     },
                 },
             },
@@ -348,9 +313,10 @@ async def test_acp_backend_streams_fake_agent(
     ]
 
     assert responses
-    assert responses[-1].stop_requested is True
-    assert "Executive Summary" in responses[-1].content
-    assert "Recommendations" in responses[-1].content
+    assert responses[-1].stop_requested is False
+    assert responses[-1].tool_invocations == [
+        {"toolName": "think", "args": {"thought": "Assess repo"}}
+    ]
     assert llm._total_stats.requests == 1
     assert '"direction": "send"' in debug_log.read_text(encoding="utf-8")
     assert '"method": "session/update"' in debug_log.read_text(encoding="utf-8")
