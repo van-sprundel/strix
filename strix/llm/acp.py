@@ -3,6 +3,7 @@ import contextlib
 import json
 import shlex
 import sys
+import time
 from asyncio.subprocess import PIPE, Process
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -39,12 +40,22 @@ class ACPClient:
         self._session_id: str | None = None
         self._auth_methods: list[dict[str, Any]] = []
         self._config_options: list[dict[str, Any]] = []
+        self._debug_log_path = Config.get("strix_acp_debug_log")
+        self._idle_timeout = self._float_config("strix_acp_idle_timeout", 60.0)
         self._closed = False
 
     def _default_command(self, agent: str) -> str:
         if agent == "codex":
             return "codex-acp"
         return agent
+
+    def _float_config(self, name: str, default: float) -> float:
+        value = Config.get(name)
+        if value is None:
+            return default
+        with contextlib.suppress(ValueError, TypeError):
+            return float(value)
+        return default
 
     async def start(self) -> None:
         if self._process is not None:
@@ -260,12 +271,22 @@ class ACPClient:
             },
         )
         pending = self._pending[request_id]
+        last_update = time.monotonic()
+        active_tools: dict[str, dict[str, Any]] = {}
 
         while not pending.done():
             try:
-                update = await asyncio.wait_for(self._updates.get(), timeout=0.1)
+                update = await asyncio.wait_for(self._updates.get(), timeout=0.5)
             except TimeoutError:
+                if (
+                    active_tools
+                    and self._idle_timeout > 0
+                    and time.monotonic() - last_update > self._idle_timeout
+                ):
+                    await self._cancel_idle_turn(active_tools)
                 continue
+            last_update = time.monotonic()
+            self._track_active_tool(active_tools, update)
             yield update
 
         while not self._updates.empty():
@@ -273,6 +294,39 @@ class ACPClient:
 
         result = pending.result()
         yield {"sessionUpdate": "turn_complete", "result": result}
+
+    def _track_active_tool(
+        self, active_tools: dict[str, dict[str, Any]], update: dict[str, Any]
+    ) -> None:
+        update_type = update.get("sessionUpdate")
+        tool_call_id = str(update.get("toolCallId") or "")
+        if not tool_call_id:
+            return
+        if update_type == "tool_call":
+            active_tools[tool_call_id] = update
+        elif update_type == "tool_call_update":
+            status = str(update.get("status") or "")
+            if status in {"completed", "failed", "cancelled"}:
+                active_tools.pop(tool_call_id, None)
+
+    async def _cancel_idle_turn(self, active_tools: dict[str, dict[str, Any]]) -> None:
+        with contextlib.suppress(Exception):
+            await self.cancel()
+
+        tool_hint = ""
+        if active_tools:
+            tool_id, tool = next(reversed(active_tools.items()))
+            title = tool.get("title") or tool.get("kind") or "ACP tool"
+            tool_hint = f" Last active tool: {title} ({tool_id})."
+        debug_hint = (
+            f" See STRIX_ACP_DEBUG_LOG at {self._debug_log_path}."
+            if self._debug_log_path
+            else ""
+        )
+        raise ACPError(
+            f"ACP turn produced no events for {self._idle_timeout:g}s and was cancelled."
+            f"{tool_hint}{debug_hint}"
+        )
 
     async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         request_id = await self.send_request(method, params or {})
@@ -292,6 +346,7 @@ class ACPClient:
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._process is None or self._process.stdin is None:
             raise ACPError("ACP process is not running")
+        self._debug_log("send", payload)
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         self._process.stdin.write(data.encode("utf-8") + b"\n")
         await self._process.stdin.drain()
@@ -308,7 +363,9 @@ class ACPClient:
             try:
                 message = json.loads(line.decode("utf-8"))
             except json.JSONDecodeError:
+                self._debug_log("recv_invalid_json", {"line": line.decode("utf-8", "replace")})
                 continue
+            self._debug_log("recv", message)
             await self._handle_message(message)
 
         if not self._closed:
@@ -396,6 +453,22 @@ class ACPClient:
             line = await stderr.readline()
             if not line:
                 break
+            self._debug_log("stderr", {"line": line.decode("utf-8", "replace").rstrip("\n")})
+
+    def _debug_log(self, direction: str, payload: Any) -> None:
+        if not self._debug_log_path:
+            return
+
+        record = {
+            "time": time.time(),
+            "direction": direction,
+            "payload": payload,
+        }
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            path = Path(self._debug_log_path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     async def cancel(self) -> None:
         if self._session_id:

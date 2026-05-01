@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from strix.interface.utils import configure_acp_cwd
+from strix.llm.acp import ACPClient, ACPError
 from strix.llm.config import LLMConfig
 from strix.llm.llm import LLM
 from strix.llm.mcp_server import _call_tool, _list_tools
@@ -81,6 +82,8 @@ for line in sys.stdin:
         )
         send({"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": []}})
     elif method == "session/prompt":
+        prompt = request["params"]["prompt"][0]["text"]
+        assert "Keep shell output bounded" in prompt
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -147,11 +150,89 @@ for line in sys.stdin:
 """
 
 
+FAKE_ACP_HANG = r"""
+import json
+import sys
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "session-1"}})
+    elif method == "session/prompt":
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1",
+                    "title": "rg stuck",
+                    "kind": "search",
+                },
+            },
+        })
+    elif method == "session/close":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+"""
+
+
+FAKE_ACP_SILENT_THEN_DONE = r"""
+import json
+import sys
+import time
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "session-1"}})
+    elif method == "session/prompt":
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-1",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [],
+                },
+            },
+        })
+        time.sleep(0.2)
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+    elif method == "session/close":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+"""
+
+
 @pytest.mark.asyncio
 async def test_acp_backend_streams_fake_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_acp = tmp_path / "fake_acp.py"
+    debug_log = tmp_path / "acp-debug.jsonl"
     fake_acp.write_text(FAKE_ACP, encoding="utf-8")
 
     monkeypatch.setenv("STRIX_LLM", "acp/codex")
@@ -159,6 +240,7 @@ async def test_acp_backend_streams_fake_agent(
     monkeypatch.setenv("STRIX_ACP_CWD", str(tmp_path))
     monkeypatch.setenv("STRIX_ACP_MODEL", "gpt-5.5")
     monkeypatch.setenv("STRIX_ACP_REASONING_EFFORT", "high")
+    monkeypatch.setenv("STRIX_ACP_DEBUG_LOG", str(debug_log))
 
     llm = LLM(LLMConfig(), agent_name=None)
     responses = [
@@ -171,6 +253,48 @@ async def test_acp_backend_streams_fake_agent(
     assert "Executive Summary" in responses[-1].content
     assert "Recommendations" in responses[-1].content
     assert llm._total_stats.requests == 1
+    assert '"direction": "send"' in debug_log.read_text(encoding="utf-8")
+    assert '"method": "session/update"' in debug_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_acp_prompt_idle_timeout_cancels_stuck_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_acp = tmp_path / "fake_acp_hang.py"
+    fake_acp.write_text(FAKE_ACP_HANG, encoding="utf-8")
+
+    monkeypatch.setenv("STRIX_ACP_COMMAND", f"{sys.executable} {fake_acp}")
+    monkeypatch.setenv("STRIX_ACP_CWD", str(tmp_path))
+    monkeypatch.setenv("STRIX_ACP_IDLE_TIMEOUT", "0.1")
+
+    client = ACPClient(agent="codex", timeout=5)
+    try:
+        with pytest.raises(ACPError, match="Last active tool: rg stuck"):
+            async for _ in client.prompt("hang"):
+                pass
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_acp_prompt_idle_timeout_allows_model_silence_without_active_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_acp = tmp_path / "fake_acp_silent.py"
+    fake_acp.write_text(FAKE_ACP_SILENT_THEN_DONE, encoding="utf-8")
+
+    monkeypatch.setenv("STRIX_ACP_COMMAND", f"{sys.executable} {fake_acp}")
+    monkeypatch.setenv("STRIX_ACP_CWD", str(tmp_path))
+    monkeypatch.setenv("STRIX_ACP_IDLE_TIMEOUT", "0.1")
+
+    client = ACPClient(agent="codex", timeout=5)
+    try:
+        updates = [update async for update in client.prompt("think")]
+    finally:
+        await client.close()
+
+    assert updates[-1]["sessionUpdate"] == "turn_complete"
 
 
 def test_configure_acp_cwd_uses_first_local_source(

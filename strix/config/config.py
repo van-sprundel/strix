@@ -29,6 +29,8 @@ class Config:
     strix_acp_enable_mcp = "true"
     strix_acp_model = None
     strix_acp_reasoning_effort = None
+    strix_acp_debug_log = None
+    strix_acp_idle_timeout = "60"
     _LLM_CANONICAL_NAMES = (
         "strix_llm",
         "llm_api_key",
@@ -47,6 +49,8 @@ class Config:
         "strix_acp_enable_mcp",
         "strix_acp_model",
         "strix_acp_reasoning_effort",
+        "strix_acp_debug_log",
+        "strix_acp_idle_timeout",
     )
 
     # Tool & Feature Configuration

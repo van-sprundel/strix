@@ -227,9 +227,12 @@ class LLM:
         guidance = (
             "You are running as the ACP-backed Codex agent for Strix. "
             "Perform the requested authorized security assessment using your available "
-            "tools. Do not try to call Strix XML tools. When complete, produce a final "
-            "report with these exact markdown headings: Executive Summary, Methodology, "
-            "Technical Analysis, Recommendations."
+            "tools. Do not try to call Strix XML tools. Keep shell output bounded: add "
+            "limits such as `| head -200`, `--max-count`, narrower globs, or targeted "
+            "paths for broad searches, avoid shell pipelines when a direct command can "
+            "produce a bounded result, and avoid commands that emit thousands of lines. "
+            "When complete, produce a final report with these exact markdown headings: "
+            "Executive Summary, Methodology, Technical Analysis, Recommendations."
         )
         return f"{guidance}\n\nTask:\n{last_user}"
 
@@ -479,7 +482,11 @@ class LLM:
         from strix.telemetry import posthog
 
         posthog.error("llm_error", type(e).__name__)
-        raise LLMRequestFailedError(f"LLM request failed: {type(e).__name__}", str(e)) from e
+        details = str(e)
+        message = f"LLM request failed: {type(e).__name__}"
+        if details:
+            message = f"{message}: {details}"
+        raise LLMRequestFailedError(message, details) from e
 
     def _is_anthropic(self) -> bool:
         if not self.config.model_name:
