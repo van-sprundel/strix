@@ -1,7 +1,10 @@
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -458,6 +461,22 @@ async def test_strix_mcp_terminal_execute_runs_locally(
     assert "owned by mcp" in result["content"][0]["text"]
 
 
+@pytest.mark.asyncio
+async def test_acp_prefers_http_mcp_when_agent_supports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STRIX_ACP_DEBUG_LOG", str(tmp_path / "acp-debug.jsonl"))
+    client = ACPClient("codex", timeout=1, cwd=str(tmp_path), command="codex-acp")
+    client._mcp_capabilities = {"http": True}
+    try:
+        servers = await client._mcp_servers()
+        assert servers[0]["type"] == "http"
+        assert servers[0]["name"] == "strix"
+        assert servers[0]["url"].startswith("http://127.0.0.1:")
+    finally:
+        await client.close()
+
+
 def test_strix_mcp_server_responds_over_stdio() -> None:
     messages = [
         {
@@ -515,3 +534,54 @@ def test_strix_mcp_server_writes_debug_log(tmp_path: Path) -> None:
     written = debug_log.read_text(encoding="utf-8")
     assert '"direction": "startup"' in written
     assert '"method": "tools/list"' in written
+
+
+def test_strix_mcp_server_responds_over_http(tmp_path: Path) -> None:
+    debug_log = tmp_path / "mcp-http-debug.jsonl"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+
+    env = os.environ.copy()
+    env["STRIX_MCP_DEBUG_LOG"] = str(debug_log)
+    process = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            str(Path("strix/llm/mcp_server.py").resolve()),
+            "--http",
+            "127.0.0.1",
+            str(port),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        url = f"http://127.0.0.1:{port}/mcp"
+        while True:
+            try:
+                payload = json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode("utf-8")
+                request = urllib.request.Request(  # noqa: S310
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310
+                    body = response.read()
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+        assert b'"name":"terminal_execute"' in body
+        written = debug_log.read_text(encoding="utf-8")
+        assert '"direction": "http_recv"' in written
+        assert '"method": "tools/list"' in written
+    finally:
+        process.terminate()
+        process.wait(timeout=5)

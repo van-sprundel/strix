@@ -1,9 +1,12 @@
+import argparse
 import asyncio
 import inspect
 import json
 import os
 import sys
 import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -14,6 +17,7 @@ from strix.tools.registry import get_tool_param_schema, needs_agent_state, tools
 
 
 PROTOCOL_VERSION = "2024-11-05"
+MCP_SESSION_ID = "strix"
 EXCLUDED_TOOLS = {
     "create_agent",
     "send_message_to_agent",
@@ -70,6 +74,10 @@ def _write_message(message: dict[str, Any]) -> None:
     sys.stdout.buffer.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii"))
     sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
+
+
+def _json_response_payload(message: dict[str, Any]) -> bytes:
+    return json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def _response(request_id: Any, result: Any) -> dict[str, Any]:
@@ -348,8 +356,89 @@ def _run() -> None:
             raise
 
 
+class MCPHTTPHandler(BaseHTTPRequestHandler):
+    server_version = "StrixMCP/0.1"
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_common_headers()
+        self.end_headers()
+
+    def do_DELETE(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_common_headers()
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "MCP endpoint accepts POST requests")
+
+    def do_POST(self) -> None:
+        if self.path != "/mcp":
+            self.send_error(HTTPStatus.NOT_FOUND, "Unknown MCP endpoint")
+            return
+
+        try:
+            length = int(self.headers.get("content-length", "0"))
+            body = self.rfile.read(length)
+            message = json.loads(body.decode("utf-8"))
+            _debug_log(
+                "http_recv",
+                {
+                    "headers": dict(self.headers.items()),
+                    "body": message,
+                },
+            )
+            response = asyncio.run(_handle_request(message))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+            _debug_log("http_error", {"type": type(e).__name__, "message": str(e)})
+            response = _error(None, -32700, str(e))
+
+        if response is None:
+            self.send_response(HTTPStatus.ACCEPTED)
+            self._send_common_headers()
+            self.end_headers()
+            return
+
+        _debug_log("http_send", response)
+        payload = _json_response_payload(response)
+        self.send_response(HTTPStatus.OK)
+        self._send_common_headers()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_common_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS, DELETE")
+        self.send_header("Mcp-Session-Id", MCP_SESSION_ID)
+
+    def log_message(self, message_format: str, *args: Any) -> None:
+        _debug_log("http_access", {"message": message_format % args})
+
+
+def _run_http(host: str, port: int) -> None:
+    _debug_log(
+        "http_startup",
+        {
+            "host": host,
+            "port": port,
+            "cwd": str(Path.cwd()),
+            "target_cwd": os.getenv("STRIX_MCP_CWD"),
+        },
+    )
+    ThreadingHTTPServer((host, port), MCPHTTPHandler).serve_forever()
+
+
 def main() -> None:
-    _run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", nargs=2, metavar=("HOST", "PORT"))
+    args = parser.parse_args()
+    if args.http:
+        _run_http(args.http[0], int(args.http[1]))
+    else:
+        _run()
 
 
 if __name__ == "__main__":

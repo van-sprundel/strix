@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import sys
 import time
 from asyncio.subprocess import PIPE, Process
@@ -63,6 +64,9 @@ class ACPClient:
         self._updates: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._session_id: str | None = None
         self._auth_methods: list[dict[str, Any]] = []
+        self._mcp_capabilities: dict[str, Any] = {}
+        self._mcp_process: Process | None = None
+        self._mcp_http_port: int | None = None
         self._config_options: list[dict[str, Any]] = []
         self._debug_log_path = Config.get("strix_acp_debug_log")
         self._idle_timeout = self._float_config("strix_acp_idle_timeout", 60.0)
@@ -120,6 +124,14 @@ class ACPClient:
             with contextlib.suppress(Exception):
                 await self._release_terminal(terminal_id)
 
+        if self._mcp_process and self._mcp_process.returncode is None:
+            self._mcp_process.terminate()
+            try:
+                await asyncio.wait_for(self._mcp_process.wait(), timeout=2)
+            except TimeoutError:
+                self._mcp_process.kill()
+                await self._mcp_process.wait()
+
         for task in (self._reader_task, self._stderr_task):
             if task and not task.done():
                 task.cancel()
@@ -152,6 +164,11 @@ class ACPClient:
             auth_methods = result.get("authMethods")
             if isinstance(auth_methods, list):
                 self._auth_methods = [m for m in auth_methods if isinstance(m, dict)]
+            agent_capabilities = result.get("agentCapabilities")
+            if isinstance(agent_capabilities, dict):
+                mcp_capabilities = agent_capabilities.get("mcpCapabilities")
+                if isinstance(mcp_capabilities, dict):
+                    self._mcp_capabilities = mcp_capabilities
 
     async def _authenticate_if_available(self) -> None:
         method_id = self._select_auth_method_id()
@@ -180,11 +197,12 @@ class ACPClient:
         return str(method_id) if method_id else None
 
     async def _new_session(self) -> None:
+        mcp_servers = await self._mcp_servers()
         result = await self.request(
             "session/new",
             {
                 "cwd": str(Path(self.cwd).resolve()),
-                "mcpServers": self._mcp_servers(),
+                "mcpServers": mcp_servers,
             },
         )
         if not isinstance(result, dict) or not result.get("sessionId"):
@@ -197,10 +215,21 @@ class ACPClient:
         if isinstance(options, list):
             self._config_options = [option for option in options if isinstance(option, dict)]
 
-    def _mcp_servers(self) -> list[dict[str, Any]]:
+    async def _mcp_servers(self) -> list[dict[str, Any]]:
         enabled = (Config.get("strix_acp_enable_mcp") or "true").lower()
         if enabled in {"0", "false", "no", "off"}:
             return []
+
+        if self._mcp_transport() == "http":
+            port = await self._start_http_mcp_server()
+            return [
+                {
+                    "type": "http",
+                    "name": "strix",
+                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "headers": [],
+                }
+            ]
 
         env = [
             {"name": "STRIX_MCP_CWD", "value": str(Path(self.cwd).resolve())},
@@ -219,6 +248,63 @@ class ACPClient:
                 "env": env,
             }
         ]
+
+    def _mcp_transport(self) -> str:
+        configured = (Config.get("strix_acp_mcp_transport") or "auto").lower()
+        if configured in {"http", "stdio"}:
+            return configured
+        if self._mcp_capabilities.get("http") is True:
+            return "http"
+        return "stdio"
+
+    async def _start_http_mcp_server(self) -> int:
+        if self._mcp_process and self._mcp_process.returncode is None:
+            assert self._mcp_http_port is not None
+            return self._mcp_http_port
+
+        port = self._reserve_local_port()
+        env = os.environ.copy()
+        env["STRIX_MCP_CWD"] = str(Path(self.cwd).resolve())
+        env["STRIX_SANDBOX_MODE"] = "false"
+        env["STRIX_DISABLE_BROWSER"] = "true"
+        mcp_debug_log = self._mcp_debug_log_path()
+        if mcp_debug_log:
+            env["STRIX_MCP_DEBUG_LOG"] = mcp_debug_log
+
+        self._mcp_process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(Path(__file__).with_name("mcp_server.py").resolve()),
+            "--http",
+            "127.0.0.1",
+            str(port),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=self.cwd if Path(self.cwd).exists() else None,
+            env=env,
+        )
+        self._mcp_http_port = port
+        await self._wait_for_http_mcp_server(port)
+        return port
+
+    def _reserve_local_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    async def _wait_for_http_mcp_server(self, port: int) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if self._mcp_process and self._mcp_process.returncode is not None:
+                raise ACPError("Strix MCP HTTP server exited before accepting connections")
+            try:
+                _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                await writer.wait_closed()
+            except OSError:
+                await asyncio.sleep(0.05)
+            else:
+                return
+        raise ACPError("Timed out waiting for Strix MCP HTTP server to start")
 
     def _mcp_debug_log_path(self) -> str | None:
         configured = os.getenv("STRIX_MCP_DEBUG_LOG")

@@ -27,6 +27,7 @@ class Config:
     strix_acp_cwd = None
     strix_acp_auth_method = None
     strix_acp_enable_mcp = "true"
+    strix_acp_mcp_transport = "auto"
     strix_acp_model = None
     strix_acp_reasoning_effort = None
     strix_acp_debug_log = None
@@ -47,6 +48,7 @@ class Config:
         "strix_acp_cwd",
         "strix_acp_auth_method",
         "strix_acp_enable_mcp",
+        "strix_acp_mcp_transport",
         "strix_acp_model",
         "strix_acp_reasoning_effort",
         "strix_acp_debug_log",
