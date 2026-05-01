@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -27,6 +28,23 @@ TERMINAL_OUTPUT_LIMIT = 64_000
 TERMINAL_TIMEOUT = 60.0
 
 
+def _debug_log(direction: str, payload: Any) -> None:
+    log_path = os.getenv("STRIX_MCP_DEBUG_LOG")
+    if not log_path:
+        return
+    entry = {
+        "time": time.time(),
+        "pid": os.getpid(),
+        "direction": direction,
+        "payload": payload,
+    }
+    try:
+        with Path(log_path).open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass
+
+
 def _read_message() -> dict[str, Any] | None:
     headers: dict[str, str] = {}
     while True:
@@ -47,6 +65,7 @@ def _read_message() -> dict[str, Any] | None:
 
 
 def _write_message(message: dict[str, Any]) -> None:
+    _debug_log("send", message)
     payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     sys.stdout.buffer.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii"))
     sys.stdout.buffer.write(payload)
@@ -190,6 +209,7 @@ def _list_tools() -> list[dict[str, Any]]:
 
 async def _execute_terminal(arguments: dict[str, Any]) -> dict[str, Any]:
     command = str(arguments.get("command") or "")
+    _debug_log("terminal_execute", {"command": command, "cwd": arguments.get("cwd")})
     if not command.strip():
         return {
             "content": [{"type": "text", "text": "Command must not be empty"}],
@@ -305,13 +325,27 @@ async def _handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _run() -> None:
+    _debug_log(
+        "startup",
+        {
+            "argv": sys.argv,
+            "cwd": str(Path.cwd()),
+            "target_cwd": os.getenv("STRIX_MCP_CWD"),
+        },
+    )
     while True:
-        message = _read_message()
-        if message is None:
-            return
-        response = asyncio.run(_handle_request(message))
-        if response is not None:
-            _write_message(response)
+        try:
+            message = _read_message()
+            if message is None:
+                _debug_log("shutdown", {"reason": "stdin_closed"})
+                return
+            _debug_log("recv", message)
+            response = asyncio.run(_handle_request(message))
+            if response is not None:
+                _write_message(response)
+        except Exception as e:
+            _debug_log("error", {"type": type(e).__name__, "message": str(e)})
+            raise
 
 
 def main() -> None:

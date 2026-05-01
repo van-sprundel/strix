@@ -39,6 +39,10 @@ for line in sys.stdin:
     elif method == "session/new":
         assert request["params"]["mcpServers"]
         assert request["params"]["mcpServers"][0]["name"] == "strix"
+        assert request["params"]["mcpServers"][0]["args"][0].endswith("mcp_server.py")
+        assert {
+            item["name"]: item["value"] for item in request["params"]["mcpServers"][0]["env"]
+        }["STRIX_MCP_DEBUG_LOG"].endswith("acp-debug.mcp.jsonl")
         send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -86,6 +90,7 @@ for line in sys.stdin:
     elif method == "session/prompt":
         prompt = request["params"]["prompt"][0]["text"]
         assert "Keep shell output bounded" in prompt
+        assert "mcp__strix__terminal_execute" in prompt
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -483,3 +488,30 @@ def test_strix_mcp_server_responds_over_stdio() -> None:
     )
 
     assert b'"name":"terminal_execute"' in process.stdout
+
+
+def test_strix_mcp_server_writes_debug_log(tmp_path: Path) -> None:
+    debug_log = tmp_path / "mcp-debug.jsonl"
+    message = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    }
+    payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    wire = b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+    env = os.environ.copy()
+    env["STRIX_MCP_DEBUG_LOG"] = str(debug_log)
+
+    subprocess.run(  # noqa: S603
+        [sys.executable, str(Path("strix/llm/mcp_server.py").resolve())],
+        input=wire,
+        capture_output=True,
+        timeout=10,
+        check=True,
+        env=env,
+    )
+
+    written = debug_log.read_text(encoding="utf-8")
+    assert '"direction": "startup"' in written
+    assert '"method": "tools/list"' in written

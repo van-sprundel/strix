@@ -202,18 +202,34 @@ class ACPClient:
         if enabled in {"0", "false", "no", "off"}:
             return []
 
+        env = [
+            {"name": "STRIX_MCP_CWD", "value": str(Path(self.cwd).resolve())},
+            {"name": "STRIX_SANDBOX_MODE", "value": "false"},
+            {"name": "STRIX_DISABLE_BROWSER", "value": "true"},
+        ]
+        mcp_debug_log = self._mcp_debug_log_path()
+        if mcp_debug_log:
+            env.append({"name": "STRIX_MCP_DEBUG_LOG", "value": mcp_debug_log})
+
         return [
             {
                 "name": "strix",
                 "command": sys.executable,
-                "args": ["-m", "strix.llm.mcp_server"],
-                "env": [
-                    {"name": "STRIX_MCP_CWD", "value": str(Path(self.cwd).resolve())},
-                    {"name": "STRIX_SANDBOX_MODE", "value": "false"},
-                    {"name": "STRIX_DISABLE_BROWSER", "value": "true"},
-                ],
+                "args": [str(Path(__file__).with_name("mcp_server.py").resolve())],
+                "env": env,
             }
         ]
+
+    def _mcp_debug_log_path(self) -> str | None:
+        configured = os.getenv("STRIX_MCP_DEBUG_LOG")
+        if configured:
+            return configured
+        if not self._debug_log_path:
+            return None
+
+        path = Path(self._debug_log_path)
+        suffix = path.suffix or ".jsonl"
+        return str(path.with_name(f"{path.stem}.mcp{suffix}"))
 
     async def _configure_session(self) -> None:
         if not self._session_id:
