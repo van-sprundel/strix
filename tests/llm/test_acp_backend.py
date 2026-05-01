@@ -36,7 +36,50 @@ for line in sys.stdin:
     elif method == "session/new":
         assert request["params"]["mcpServers"]
         assert request["params"]["mcpServers"][0]["name"] == "strix"
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": "session-1"}})
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "sessionId": "session-1",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "category": "model",
+                        "type": "select",
+                        "currentValue": "gpt-5.4",
+                        "options": [
+                            {"value": "gpt-5.4", "name": "GPT-5.4"},
+                            {"value": "gpt-5.5", "name": "GPT-5.5"},
+                        ],
+                    },
+                    {
+                        "id": "reasoning-effort",
+                        "name": "Reasoning",
+                        "category": "thought_level",
+                        "type": "select",
+                        "currentValue": "medium",
+                        "options": [
+                            {"value": "medium", "name": "Medium"},
+                            {"value": "high", "name": "High"},
+                        ],
+                    },
+                ],
+            },
+        })
+    elif method == "session/set_config_option":
+        assert request["params"]["sessionId"] == "session-1"
+        assert (
+            request["params"] in [
+                {"sessionId": "session-1", "configId": "model", "value": "gpt-5.5"},
+                {
+                    "sessionId": "session-1",
+                    "configId": "reasoning-effort",
+                    "value": "high",
+                },
+            ]
+        )
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": []}})
     elif method == "session/prompt":
         send({
             "jsonrpc": "2.0",
@@ -114,6 +157,8 @@ async def test_acp_backend_streams_fake_agent(
     monkeypatch.setenv("STRIX_LLM", "acp/codex")
     monkeypatch.setenv("STRIX_ACP_COMMAND", f"{sys.executable} {fake_acp}")
     monkeypatch.setenv("STRIX_ACP_CWD", str(tmp_path))
+    monkeypatch.setenv("STRIX_ACP_MODEL", "gpt-5.5")
+    monkeypatch.setenv("STRIX_ACP_REASONING_EFFORT", "high")
 
     llm = LLM(LLMConfig(), agent_name=None)
     responses = [

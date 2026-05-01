@@ -38,6 +38,7 @@ class ACPClient:
         self._updates: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._session_id: str | None = None
         self._auth_methods: list[dict[str, Any]] = []
+        self._config_options: list[dict[str, Any]] = []
         self._closed = False
 
     def _default_command(self, agent: str) -> str:
@@ -149,6 +150,12 @@ class ACPClient:
         if not isinstance(result, dict) or not result.get("sessionId"):
             raise ACPError(f"ACP session/new returned an invalid response: {result!r}")
         self._session_id = str(result["sessionId"])
+        self._set_config_options(result.get("configOptions"))
+        await self._configure_session()
+
+    def _set_config_options(self, options: Any) -> None:
+        if isinstance(options, list):
+            self._config_options = [option for option in options if isinstance(option, dict)]
 
     def _mcp_servers(self) -> list[dict[str, Any]]:
         enabled = (Config.get("strix_acp_enable_mcp") or "true").lower()
@@ -166,6 +173,79 @@ class ACPClient:
                 ],
             }
         ]
+
+    async def _configure_session(self) -> None:
+        if not self._session_id:
+            return
+
+        model = Config.get("strix_acp_model")
+        reasoning = Config.get("strix_acp_reasoning_effort") or Config.get(
+            "strix_reasoning_effort"
+        )
+
+        if model:
+            await self._set_config_option(category="model", value=model)
+        if reasoning:
+            await self._set_config_option(category="thought_level", value=reasoning)
+
+    async def _set_config_option(self, category: str, value: str) -> None:
+        if not self._session_id:
+            return
+
+        option = self._find_config_option(category)
+        if not option:
+            return
+
+        config_id = option.get("id")
+        option_value = self._resolve_option_value(option, value)
+        if not config_id or not option_value:
+            return
+
+        with contextlib.suppress(Exception):
+            result = await self.request(
+                "session/set_config_option",
+                {
+                    "sessionId": self._session_id,
+                    "configId": str(config_id),
+                    "value": option_value,
+                },
+            )
+            if isinstance(result, dict):
+                options = result.get("configOptions")
+                if options:
+                    self._set_config_options(options)
+
+    def _find_config_option(self, category: str) -> dict[str, Any] | None:
+        for option in self._config_options:
+            if option.get("category") == category:
+                return option
+        for option in self._config_options:
+            option_id = str(option.get("id") or "").lower()
+            if category == "model" and "model" in option_id:
+                return option
+            if category == "thought_level" and any(
+                part in option_id for part in ("reason", "thought", "effort")
+            ):
+                return option
+        return None
+
+    def _resolve_option_value(self, option: dict[str, Any], wanted: str) -> str | None:
+        wanted_normalized = wanted.lower().replace("_", "-")
+        options = option.get("options")
+        if not isinstance(options, list):
+            return wanted
+
+        for candidate in options:
+            if not isinstance(candidate, dict):
+                continue
+            value = str(candidate.get("value") or "")
+            name = str(candidate.get("name") or "")
+            if value == wanted or value.lower() == wanted_normalized:
+                return value
+            if name == wanted or name.lower().replace("_", "-") == wanted_normalized:
+                return value
+
+        return None
 
     async def prompt(self, text: str) -> AsyncIterator[dict[str, Any]]:
         await self.start()
@@ -256,6 +336,8 @@ class ACPClient:
             params = message.get("params") or {}
             update = params.get("update")
             if isinstance(update, dict):
+                if update.get("sessionUpdate") == "config_option_update":
+                    self._set_config_options(update.get("configOptions"))
                 await self._updates.put(update)
 
     async def _handle_agent_request(self, message: dict[str, Any]) -> None:
