@@ -24,6 +24,9 @@ class LLMConfig:
         if not self.model_name:
             raise ValueError("STRIX_LLM environment variable must be set and not empty")
 
+        self.provider_type = "acp" if self.model_name.startswith("acp/") else "litellm"
+        self.acp_agent = self.model_name[4:] if self.provider_type == "acp" else None
+
         api_model, canonical = resolve_strix_model(self.model_name)
         self.litellm_model: str = api_model or self.model_name
         self.canonical_model: str = canonical or self.model_name

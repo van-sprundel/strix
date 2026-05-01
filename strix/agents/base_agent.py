@@ -408,10 +408,32 @@ class BaseAgent(metaclass=AgentMeta):
             else []
         )
 
+        if getattr(final_response, "stop_requested", False):
+            self._complete_from_text_response(final_response.content, tracer)
+            return True
+
         if actions:
             return await self._execute_actions(actions, tracer)
 
         return None
+
+    def _complete_from_text_response(
+        self,
+        content: str,
+        tracer: Optional["Tracer"],
+    ) -> None:
+        self.state.set_completed({"success": True})
+        if tracer:
+            tracer.update_agent_status(self.state.agent_id, "completed")
+            if self.state.parent_id is None:
+                tracer.update_scan_final_fields(
+                    executive_summary=content.strip() or "ACP agent completed the scan.",
+                    methodology="Assessment performed by the configured ACP agent.",
+                    technical_analysis=(
+                        content.strip() or "No additional technical analysis provided."
+                    ),
+                    recommendations=content.strip() or "No additional recommendations provided.",
+                )
 
     async def _execute_actions(self, actions: list[Any], tracer: Optional["Tracer"]) -> bool:
         """Execute actions and return True if agent should finish."""

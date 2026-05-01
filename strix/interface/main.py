@@ -57,6 +57,7 @@ def validate_environment() -> None:  # noqa: PLR0912, PLR0915
 
     strix_llm = Config.get("strix_llm")
     uses_strix_models = strix_llm and strix_llm.startswith("strix/")
+    uses_acp = strix_llm and strix_llm.startswith("acp/")
 
     if not strix_llm:
         missing_required_vars.append("STRIX_LLM")
@@ -70,10 +71,10 @@ def validate_environment() -> None:  # noqa: PLR0912, PLR0915
         ]
     )
 
-    if not Config.get("llm_api_key"):
+    if not uses_acp and not Config.get("llm_api_key"):
         missing_optional_vars.append("LLM_API_KEY")
 
-    if not has_base_url:
+    if not uses_acp and not has_base_url:
         missing_optional_vars.append("LLM_API_BASE")
 
     if not Config.get("perplexity_api_key"):
@@ -209,6 +210,9 @@ async def warm_up_llm() -> None:
 
     try:
         model_name, api_key, api_base = resolve_llm_config()
+        if model_name and model_name.startswith("acp/"):
+            return
+
         litellm_model, _ = resolve_strix_model(model_name)
         litellm_model = litellm_model or model_name
 

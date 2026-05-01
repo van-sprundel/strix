@@ -9,6 +9,7 @@ from litellm import acompletion, completion_cost, stream_chunk_builder, supports
 from litellm.utils import supports_prompt_caching, supports_vision
 
 from strix.config import Config
+from strix.llm.acp import ACPClient
 from strix.llm.config import LLMConfig
 from strix.llm.memory_compressor import MemoryCompressor
 from strix.llm.utils import (
@@ -18,6 +19,7 @@ from strix.llm.utils import (
     parse_tool_invocations,
 )
 from strix.skills import load_skills
+from strix.telemetry.tracer import get_global_tracer
 from strix.tools import get_tools_prompt
 from strix.utils.resource_paths import get_strix_resource_path
 
@@ -38,6 +40,7 @@ class LLMResponse:
     content: str
     tool_invocations: list[dict[str, Any]] | None = None
     thinking_blocks: list[dict[str, Any]] | None = None
+    stop_requested: bool = False
 
 
 @dataclass
@@ -68,7 +71,13 @@ class LLM:
             getattr(config, "system_prompt_context", {}) or {}
         )
         self._total_stats = RequestStats()
-        self.memory_compressor = MemoryCompressor(model_name=config.litellm_model)
+        self.memory_compressor = (
+            None
+            if getattr(config, "provider_type", None) == "acp"
+            else MemoryCompressor(model_name=config.litellm_model)
+        )
+        self._acp_client: ACPClient | None = None
+        self._acp_tool_executions: dict[str, Any] = {}
         self.system_prompt = self._load_system_prompt(agent_name)
 
         reasoning = Config.get("strix_reasoning_effort")
@@ -156,6 +165,11 @@ class LLM:
     async def generate(
         self, conversation_history: list[dict[str, Any]]
     ) -> AsyncIterator[LLMResponse]:
+        if getattr(self.config, "provider_type", None) == "acp":
+            async for response in self._generate_acp(conversation_history):
+                yield response
+            return
+
         messages = self._prepare_messages(conversation_history)
         max_retries = int(Config.get("strix_llm_max_retries") or "5")
 
@@ -169,6 +183,110 @@ class LLM:
                     self._raise_error(e)
                 wait = min(90, 2 * (2**attempt))
                 await asyncio.sleep(wait)
+
+    async def _generate_acp(
+        self, conversation_history: list[dict[str, Any]]
+    ) -> AsyncIterator[LLMResponse]:
+        prompt = self._build_acp_prompt(conversation_history)
+        accumulated = ""
+
+        if self._acp_client is None:
+            self._acp_client = ACPClient(
+                agent=getattr(self.config, "acp_agent", None) or "codex",
+                timeout=self.config.timeout,
+            )
+
+        self._total_stats.requests += 1
+
+        try:
+            async for update in self._acp_client.prompt(prompt):
+                update_type = update.get("sessionUpdate")
+                if update_type in {"agent_message_chunk", "user_message_chunk"}:
+                    text = self._extract_acp_text(update.get("content"))
+                    if text:
+                        accumulated += text
+                        yield LLMResponse(content=accumulated)
+                elif update_type == "tool_call":
+                    self._record_acp_tool_call(update)
+                elif update_type == "tool_call_update":
+                    self._record_acp_tool_update(update)
+                elif update_type == "turn_complete":
+                    yield LLMResponse(content=accumulated, stop_requested=True)
+                    return
+        except Exception as e:  # noqa: BLE001
+            self._raise_error(e)
+
+    def _build_acp_prompt(self, conversation_history: list[dict[str, Any]]) -> str:
+        last_user = ""
+        for message in reversed(conversation_history):
+            if message.get("role") == "user":
+                last_user = self._message_to_text(message)
+                break
+
+        guidance = (
+            "You are running as the ACP-backed Codex agent for Strix. "
+            "Perform the requested authorized security assessment using your available "
+            "tools and produce a concise final report with methodology, findings, "
+            "evidence, and recommendations. Do not try to call Strix XML tools."
+        )
+        return f"{guidance}\n\nTask:\n{last_user}"
+
+    def _message_to_text(self, message: dict[str, Any]) -> str:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif isinstance(item, dict) and item.get("type") == "image_url":
+                    parts.append("[Image attached]")
+            return "\n".join(parts)
+        return str(content)
+
+    def _extract_acp_text(self, content: Any) -> str:
+        if isinstance(content, dict) and content.get("type") == "text":
+            return str(content.get("text", ""))
+        if isinstance(content, str):
+            return content
+        return ""
+
+    def _record_acp_tool_call(self, update: dict[str, Any]) -> None:
+        try:
+            tracer = get_global_tracer()
+            if not tracer:
+                return
+            tool_call_id = str(update.get("toolCallId") or "")
+            title = str(update.get("title") or update.get("kind") or "ACP tool")
+            execution_id = tracer.log_tool_execution_start(
+                self.agent_id or "unknown_agent",
+                f"acp:{title}",
+                update.get("rawInput") or {},
+            )
+            if tool_call_id:
+                self._acp_tool_executions[tool_call_id] = execution_id
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    def _record_acp_tool_update(self, update: dict[str, Any]) -> None:
+        try:
+            tracer = get_global_tracer()
+            if not tracer:
+                return
+            tool_call_id = str(update.get("toolCallId") or "")
+            execution_id = self._acp_tool_executions.get(tool_call_id)
+            if not execution_id:
+                return
+            status = str(update.get("status") or "in_progress")
+            mapped_status = "error" if status == "failed" else status
+            tracer.update_tool_execution(
+                execution_id,
+                mapped_status,
+                update.get("rawOutput") or update.get("content") or {},
+            )
+        except Exception:  # noqa: BLE001, S110
+            pass
 
     async def _stream(self, messages: list[dict[str, Any]]) -> AsyncIterator[LLMResponse]:
         accumulated = ""
@@ -234,7 +352,10 @@ class LLM:
                 }
             )
 
-        compressed = list(self.memory_compressor.compress_history(conversation_history))
+        if self.memory_compressor is None:
+            compressed = list(conversation_history)
+        else:
+            compressed = list(self.memory_compressor.compress_history(conversation_history))
         conversation_history.clear()
         conversation_history.extend(compressed)
         messages.extend(compressed)

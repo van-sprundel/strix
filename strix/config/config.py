@@ -22,6 +22,10 @@ class Config:
     strix_llm_max_retries = "5"
     strix_memory_compressor_timeout = "30"
     llm_timeout = "300"
+    strix_acp_command = None
+    strix_acp_permission = "allow_once"
+    strix_acp_cwd = None
+    strix_acp_auth_method = None
     _LLM_CANONICAL_NAMES = (
         "strix_llm",
         "llm_api_key",
@@ -33,6 +37,10 @@ class Config:
         "strix_llm_max_retries",
         "strix_memory_compressor_timeout",
         "llm_timeout",
+        "strix_acp_command",
+        "strix_acp_permission",
+        "strix_acp_cwd",
+        "strix_acp_auth_method",
     )
 
     # Tool & Feature Configuration
