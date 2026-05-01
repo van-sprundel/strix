@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Optional
 
 
@@ -422,18 +423,42 @@ class BaseAgent(metaclass=AgentMeta):
         content: str,
         tracer: Optional["Tracer"],
     ) -> None:
+        final_fields = self._extract_final_report_fields(content)
         self.state.set_completed({"success": True})
         if tracer:
             tracer.update_agent_status(self.state.agent_id, "completed")
             if self.state.parent_id is None:
                 tracer.update_scan_final_fields(
-                    executive_summary=content.strip() or "ACP agent completed the scan.",
-                    methodology="Assessment performed by the configured ACP agent.",
-                    technical_analysis=(
-                        content.strip() or "No additional technical analysis provided."
-                    ),
-                    recommendations=content.strip() or "No additional recommendations provided.",
+                    executive_summary=final_fields["executive_summary"],
+                    methodology=final_fields["methodology"],
+                    technical_analysis=final_fields["technical_analysis"],
+                    recommendations=final_fields["recommendations"],
                 )
+
+    def _extract_final_report_fields(self, content: str) -> dict[str, str]:
+        fallback = content.strip() or "ACP agent completed the scan."
+        sections = {
+            self._normalize_heading(match.group("heading")): match.group("body").strip()
+            for match in re.finditer(
+                r"(?ms)^#{1,6}\s*(?P<heading>Executive Summary|Methodology|"
+                r"Technical Analysis|Recommendations)\s*$"
+                r"(?P<body>.*?)(?=^#{1,6}\s*(?:Executive Summary|Methodology|"
+                r"Technical Analysis|Recommendations)\s*$|\Z)",
+                content,
+            )
+        }
+
+        return {
+            "executive_summary": sections.get("executive_summary") or fallback,
+            "methodology": sections.get("methodology")
+            or "Assessment performed by the configured ACP agent.",
+            "technical_analysis": sections.get("technical_analysis") or fallback,
+            "recommendations": sections.get("recommendations")
+            or "No additional recommendations provided.",
+        }
+
+    def _normalize_heading(self, heading: str) -> str:
+        return heading.strip().lower().replace(" ", "_")
 
     async def _execute_actions(self, actions: list[Any], tracer: Optional["Tracer"]) -> bool:
         """Execute actions and return True if agent should finish."""

@@ -1,4 +1,5 @@
 from . import (
+    acp_renderer,
     agent_message_renderer,
     agents_graph_renderer,
     browser_renderer,
@@ -23,6 +24,7 @@ from .registry import ToolTUIRegistry, get_tool_renderer, register_tool_renderer
 __all__ = [
     "BaseToolRenderer",
     "ToolTUIRegistry",
+    "acp_renderer",
     "agent_message_renderer",
     "agents_graph_renderer",
     "browser_renderer",

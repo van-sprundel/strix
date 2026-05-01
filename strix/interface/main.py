@@ -33,6 +33,7 @@ from strix.interface.utils import (  # noqa: E402
     check_docker_connection,
     clone_repository,
     collect_local_sources,
+    configure_acp_cwd,
     generate_run_name,
     image_exists,
     infer_target_type,
@@ -575,6 +576,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             target_info["details"]["cloned_repo_path"] = cloned_path
 
     args.local_sources = collect_local_sources(args.targets_info)
+    configure_acp_cwd(args.local_sources)
     try:
         diff_scope = resolve_diff_scope_context(
             local_sources=args.local_sources,

@@ -1229,6 +1229,22 @@ def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, 
     return local_sources
 
 
+def configure_acp_cwd(local_sources: list[dict[str, str]]) -> None:
+    strix_llm = os.getenv("STRIX_LLM", "")
+    if not strix_llm.startswith("acp/") or os.getenv("STRIX_ACP_CWD"):
+        return
+
+    for source in local_sources:
+        source_path = source.get("source_path")
+        if not source_path:
+            continue
+
+        resolved = Path(source_path).expanduser().resolve()
+        if resolved.exists():
+            os.environ["STRIX_ACP_CWD"] = str(resolved)
+            return
+
+
 def _is_localhost_host(host: str) -> bool:
     host_lower = host.lower().strip("[]")
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -226,8 +227,9 @@ class LLM:
         guidance = (
             "You are running as the ACP-backed Codex agent for Strix. "
             "Perform the requested authorized security assessment using your available "
-            "tools and produce a concise final report with methodology, findings, "
-            "evidence, and recommendations. Do not try to call Strix XML tools."
+            "tools. Do not try to call Strix XML tools. When complete, produce a final "
+            "report with these exact markdown headings: Executive Summary, Methodology, "
+            "Technical Analysis, Recommendations."
         )
         return f"{guidance}\n\nTask:\n{last_user}"
 
@@ -261,8 +263,13 @@ class LLM:
             title = str(update.get("title") or update.get("kind") or "ACP tool")
             execution_id = tracer.log_tool_execution_start(
                 self.agent_id or "unknown_agent",
-                f"acp:{title}",
-                update.get("rawInput") or {},
+                "acp",
+                {
+                    "title": title,
+                    "kind": update.get("kind"),
+                    "tool_call_id": tool_call_id,
+                    "input": update.get("rawInput") or update.get("content") or {},
+                },
             )
             if tool_call_id:
                 self._acp_tool_executions[tool_call_id] = execution_id
@@ -279,14 +286,32 @@ class LLM:
             if not execution_id:
                 return
             status = str(update.get("status") or "in_progress")
-            mapped_status = "error" if status == "failed" else status
+            mapped_status = self._map_acp_status(status)
+            content = update.get("content")
+            if isinstance(content, dict):
+                content = content.get("text") or content
             tracer.update_tool_execution(
                 execution_id,
                 mapped_status,
-                update.get("rawOutput") or update.get("content") or {},
+                self._decode_acp_payload(update.get("rawOutput") or content or {}),
             )
         except Exception:  # noqa: BLE001, S110
             pass
+
+    def _decode_acp_payload(self, payload: Any) -> Any:
+        if not isinstance(payload, str):
+            return payload
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return payload
+
+    def _map_acp_status(self, status: str) -> str:
+        if status in {"completed", "succeeded"}:
+            return "completed"
+        if status in {"failed", "error"}:
+            return "error"
+        return "running"
 
     async def _stream(self, messages: list[dict[str, Any]]) -> AsyncIterator[LLMResponse]:
         accumulated = ""

@@ -170,6 +170,9 @@ class ACPClient:
                 continue
             yield update
 
+        while not self._updates.empty():
+            yield self._updates.get_nowait()
+
         result = pending.result()
         yield {"sessionUpdate": "turn_complete", "result": result}
 
